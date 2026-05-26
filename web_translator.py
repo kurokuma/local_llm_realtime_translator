@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import requests
+import soundcard as sc
 import sounddevice as sd
 from flask import Flask, Response, jsonify, request
 from faster_whisper import WhisperModel
@@ -58,7 +59,7 @@ def normalize_lmstudio_host(host: str) -> str:
 
 @dataclasses.dataclass
 class RuntimeConfig:
-    input_device: int | None
+    input_device: str | None
     lmstudio_host: str
     llm_model: str
     direction: str
@@ -69,6 +70,43 @@ class RuntimeConfig:
     silence_ms: int
     min_speech_ms: int
     max_segment_s: float
+
+
+@dataclasses.dataclass
+class AudioSource:
+    backend: str
+    device: int | None
+    channels: int
+    extra_settings: Any | None
+
+
+def parse_audio_source(value: str | None) -> AudioSource:
+    if value in (None, ""):
+        return AudioSource(backend="sounddevice", device=None, channels=CHANNELS, extra_settings=None)
+    if value.startswith("soundcard:"):
+        device = int(value.split(":", 1)[1])
+        return AudioSource(backend="soundcard", device=device, channels=CHANNELS, extra_settings=None)
+    return AudioSource(backend="sounddevice", device=int(value), channels=CHANNELS, extra_settings=None)
+
+
+def to_mono_pcm16(indata: bytes, channels: int) -> bytes:
+    if channels <= 1:
+        return bytes(indata)
+    samples = np.frombuffer(indata, dtype=np.int16)
+    frame_count = samples.size // channels
+    if frame_count <= 0:
+        return b""
+    samples = samples[: frame_count * channels].reshape(frame_count, channels)
+    mono = samples.astype(np.float32).mean(axis=1)
+    return np.clip(mono, -32768, 32767).astype(np.int16).tobytes()
+
+
+def soundcard_to_pcm16(data: np.ndarray) -> bytes:
+    if data.size == 0:
+        return b""
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    return np.clip(data, -1.0, 1.0).astype(np.float32).__mul__(32767.0).astype(np.int16).tobytes()
 
 
 class TranslatorRuntime:
@@ -122,7 +160,7 @@ class TranslatorRuntime:
         self.worker_thread.start()
         self.audio_thread.start()
 
-    def start_audio_check(self, input_device: int | None) -> None:
+    def start_audio_check(self, input_device: str | None) -> None:
         with self.lock:
             if self.is_audio_check_running():
                 raise RuntimeError("音声入力チェックはすでに実行中です")
@@ -224,25 +262,46 @@ class TranslatorRuntime:
             },
         )
 
-    def _audio_check_loop(self, input_device: int | None) -> None:
+    def _audio_check_loop(self, input_device: str | None) -> None:
+        source = parse_audio_source(input_device)
         last_level_at = 0.0
+
+        if source.backend == "soundcard":
+            try:
+                microphone = sc.all_microphones(include_loopback=True)[source.device or 0]
+                with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
+                    while not self.audio_check_stop.is_set():
+                        mono = soundcard_to_pcm16(recorder.record(numframes=int(SAMPLE_RATE * FRAME_MS / 1000)))
+                        now = time.time()
+                        if now - last_level_at >= 0.1:
+                            last_level_at = now
+                            self._publish_audio_level(mono, "check")
+            except Exception as exc:
+                self._publish("audio_check_status", {"running": False, "message": f"音声入力チェックエラー: {exc}"})
+            finally:
+                self.audio_check_stop.set()
+                self._publish_audio_level(bytes(FRAME_BYTES), "check")
+                self._publish("audio_check_status", {"running": False, "message": "音声入力チェックを停止しました"})
+            return
 
         def callback(indata: bytes, frames: int, time_info, status) -> None:  # noqa: ANN001
             nonlocal last_level_at
             if status:
                 self._publish("audio_check_status", {"running": True, "message": str(status)})
+            mono = to_mono_pcm16(indata, source.channels)
             now = time.time()
             if now - last_level_at >= 0.1:
                 last_level_at = now
-                self._publish_audio_level(bytes(indata), "check")
+                self._publish_audio_level(mono, "check")
 
         try:
             with sd.RawInputStream(
                 samplerate=SAMPLE_RATE,
                 blocksize=int(SAMPLE_RATE * FRAME_MS / 1000),
                 dtype="int16",
-                channels=CHANNELS,
-                device=input_device,
+                channels=source.channels,
+                device=source.device,
+                extra_settings=source.extra_settings,
                 callback=callback,
             ):
                 while not self.audio_check_stop.is_set():
@@ -258,6 +317,7 @@ class TranslatorRuntime:
         config = self.config
         if config is None:
             return
+        source = parse_audio_source(config.input_device)
         segmenter = SpeechSegmenter(
             aggressiveness=config.vad_aggressiveness,
             silence_ms=config.silence_ms,
@@ -266,16 +326,54 @@ class TranslatorRuntime:
         )
         last_level_at = 0.0
 
+        if source.backend == "soundcard":
+            try:
+                microphone = sc.all_microphones(include_loopback=True)[source.device or 0]
+                with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
+                    with self.lock:
+                        self.status = "listening"
+                    self._publish("status", {"status": "listening", "message": "音声入力を待っています"})
+                    while not self.stop_event.is_set():
+                        mono = soundcard_to_pcm16(recorder.record(numframes=int(SAMPLE_RATE * FRAME_MS / 1000)))
+                        now = time.time()
+                        if now - last_level_at >= 0.1:
+                            last_level_at = now
+                            self._publish_audio_level(mono, "translate")
+                        for i in range(0, len(mono), FRAME_BYTES):
+                            frame = mono[i : i + FRAME_BYTES]
+                            if len(frame) != FRAME_BYTES:
+                                continue
+                            segment = segmenter.process_frame(frame)
+                            if segment is None:
+                                continue
+                            try:
+                                self.segment_queue.put_nowait(segment)
+                            except queue.Full:
+                                self._publish("status", {"status": "warning", "message": "音声キューが満杯のため一部を破棄しました"})
+            except Exception as exc:
+                self._set_error(f"音声入力エラー: {type(exc).__name__}: {exc}")
+                self.stop_event.set()
+            finally:
+                final_segment = segmenter.flush()
+                if final_segment is not None:
+                    self.segment_queue.put(final_segment)
+                with self.lock:
+                    if self.status != "error":
+                        self.status = "stopped"
+                self._publish("status", {"status": "stopped", "message": "停止しました"})
+            return
+
         def callback(indata: bytes, frames: int, time_info, status) -> None:  # noqa: ANN001
             nonlocal last_level_at
             if status:
                 self._publish("status", {"status": "audio", "message": str(status)})
+            mono = to_mono_pcm16(indata, source.channels)
             now = time.time()
             if now - last_level_at >= 0.1:
                 last_level_at = now
-                self._publish_audio_level(bytes(indata), "translate")
-            for i in range(0, len(indata), FRAME_BYTES):
-                frame = indata[i : i + FRAME_BYTES]
+                self._publish_audio_level(mono, "translate")
+            for i in range(0, len(mono), FRAME_BYTES):
+                frame = mono[i : i + FRAME_BYTES]
                 if len(frame) != FRAME_BYTES:
                     continue
                 segment = segmenter.process_frame(frame)
@@ -291,8 +389,9 @@ class TranslatorRuntime:
                 samplerate=SAMPLE_RATE,
                 blocksize=int(SAMPLE_RATE * FRAME_MS / 1000),
                 dtype="int16",
-                channels=CHANNELS,
-                device=config.input_device,
+                channels=source.channels,
+                device=source.device,
+                extra_settings=source.extra_settings,
                 callback=callback,
             ):
                 with self.lock:
@@ -410,17 +509,38 @@ def create_app() -> Flask:
     @app.get("/api/devices")
     def devices():
         result = []
-        for index, device in enumerate(sd.query_devices()):
-            if int(device.get("max_input_channels", 0)) <= 0:
+        hostapis = sd.query_hostapis()
+        for index, microphone in enumerate(sc.all_microphones(include_loopback=True)):
+            if not getattr(microphone, "isloopback", False):
                 continue
             result.append(
                 {
+                    "value": f"soundcard:{index}",
                     "index": index,
-                    "name": device["name"],
-                    "channels": int(device["max_input_channels"]),
-                    "hostapi": int(device["hostapi"]),
+                    "name": microphone.name,
+                    "channels": 2,
+                    "hostapi": None,
+                    "hostapi_name": "WASAPI loopback",
+                    "kind": "loopback",
+                    "label": f"PC音声 {microphone.name} (loopback)",
                 }
             )
+        for index, device in enumerate(sd.query_devices()):
+            hostapi_name = hostapis[int(device["hostapi"])]["name"]
+            input_channels = int(device.get("max_input_channels", 0))
+            if input_channels > 0:
+                result.append(
+                    {
+                        "value": str(index),
+                        "index": index,
+                        "name": device["name"],
+                        "channels": input_channels,
+                        "hostapi": int(device["hostapi"]),
+                        "hostapi_name": hostapi_name,
+                        "kind": "input",
+                        "label": f"#{index} {device['name']} ({hostapi_name}, {input_channels}ch)",
+                    }
+                )
         return jsonify(result)
 
     @app.get("/api/models")
@@ -446,7 +566,7 @@ def create_app() -> Flask:
             return jsonify({"error": "翻訳方向が不正です"}), 400
         raw_device = data.get("input_device")
         config = RuntimeConfig(
-            input_device=None if raw_device in (None, "") else int(raw_device),
+            input_device=None if raw_device in (None, "") else str(raw_device),
             lmstudio_host=normalize_lmstudio_host(data.get("lmstudio_host") or DEFAULT_LMSTUDIO_HOST),
             llm_model=data.get("llm_model") or "",
             direction=direction,
@@ -475,7 +595,7 @@ def create_app() -> Flask:
     def audio_check_start():
         data = request.get_json(force=True)
         raw_device = data.get("input_device")
-        input_device = None if raw_device in (None, "") else int(raw_device)
+        input_device = None if raw_device in (None, "") else str(raw_device)
         try:
             runtime.start_audio_check(input_device)
         except Exception as exc:
@@ -844,11 +964,11 @@ INDEX_HTML = r"""<!doctype html>
       <div class="grid2">
         <div class="field">
           <label for="silenceMs">無音判定 ms</label>
-          <input id="silenceMs" type="number" value="700" min="200" step="100">
+          <input id="silenceMs" type="number" value="500" min="200" step="100">
         </div>
         <div class="field">
           <label for="maxSegmentS">最大秒数</label>
-          <input id="maxSegmentS" type="number" value="8" min="2" step="1">
+          <input id="maxSegmentS" type="number" value="5" min="2" step="1">
         </div>
       </div>
       <div class="actions">
@@ -955,7 +1075,7 @@ INDEX_HTML = r"""<!doctype html>
       const r = await fetch("/api/devices");
       const devices = await r.json();
       $("inputDevice").innerHTML = '<option value="">OS既定入力</option>' + devices.map(
-        (d) => `<option value="${d.index}">#${d.index} ${escapeHtml(d.name)} (${d.channels}ch)</option>`
+        (d) => `<option value="${escapeHtml(d.value)}">${escapeHtml(d.label)}</option>`
       ).join("");
     }
 
