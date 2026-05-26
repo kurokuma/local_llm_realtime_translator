@@ -1,0 +1,2 @@
+# local_llm_realtime_translator
+Local LLMでリアルタイム翻訳
