@@ -1,4 +1,4 @@
-﻿# Local LLM Realtime Translator
+# Local LLM Realtime Translator
 
 PC内部音声またはマイク音声をWhisperで文字起こしし、LM StudioのローカルLLMで日本語/英語へリアルタイム翻訳するローカルWebアプリです。
 
