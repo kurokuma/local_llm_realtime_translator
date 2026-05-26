@@ -47,8 +47,6 @@ LM Studio側でモデルを読み込み、Local Serverを開始してくださ�
 http://127.0.0.1:1234
 ```
 
-アプリ内部では必要に応じて `/v1` を付けて、LM StudioのOpenAI互換APIへアクセスします。
-
 ## 起動
 
 PowerShell:
