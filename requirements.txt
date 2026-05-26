@@ -1,0 +1,6 @@
+faster-whisper>=1.1.0
+flask>=3.0.0
+sounddevice>=0.4.7
+numpy>=1.26.0
+requests>=2.31.0
+webrtcvad-wheels>=2.0.14
