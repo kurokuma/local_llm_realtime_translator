@@ -14,6 +14,7 @@ PC内部音声 / マイク
 
 - ブラウザをGUIとして利用
 - PC内部音声用の仮想/ループバック入力、または通常マイクを選択
+- NVIDIA High Definition AudioなどのWASAPI出力をPC音声ループバックとして選択
 - 音声入力チェックで入力レベルをメーター表示
 - LM Studioのモデル一覧を取得して選択
 - 英語から日本語、日本語から英語を選択
@@ -46,6 +47,8 @@ LM Studio側でモデルを読み込み、Local Serverを開始してくださ�
 ```text
 http://127.0.0.1:1234
 ```
+
+アプリ内部では必要に応じて `/v1` を付けて、LM StudioのOpenAI互換APIへアクセスします。
 
 ## 起動
 
@@ -104,6 +107,8 @@ VB-CABLEを使う場合:
 - このアプリの入力先: `CABLE Output (VB-Audio Virtual Cable)`
 
 この環境の例では、PC内部音声の入力候補は `#33 CABLE Output (VB-Audio Virtual Cable), Windows WASAPI` です。
+
+Windowsの通常出力を直接拾う場合は、音声入力の先頭付近に出る `PC音声 ... (loopback)` を選択します。たとえばChromeの出力先がNVIDIA HDMI/Display Audioの場合は、`PC音声 モニター名 (NVIDIA High Definition Audio) (loopback)` を試してください。
 
 ## 補足
 
