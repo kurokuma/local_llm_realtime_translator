@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import json
 import queue
@@ -10,6 +11,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,13 @@ LANGUAGES = {
 
 DEFAULT_LMSTUDIO_HOST = "http://127.0.0.1:1234"
 
+PROMPT_STYLES = {
+    "conference": "Use natural real-time conference interpreter wording.",
+    "literal": "Prefer faithful, literal translation while keeping the result readable.",
+    "technical": "Preserve technical terms, product names, code-like tokens, and proper nouns as much as possible.",
+    "concise": "Make the translation concise and remove filler words when they do not affect meaning.",
+}
+
 
 def normalize_lmstudio_host(host: str) -> str:
     host = (host or DEFAULT_LMSTUDIO_HOST).strip().rstrip("/")
@@ -70,6 +79,7 @@ class RuntimeConfig:
     silence_ms: int
     min_speech_ms: int
     max_segment_s: float
+    prompt_style: str
 
 
 @dataclasses.dataclass
@@ -125,6 +135,15 @@ class TranslatorRuntime:
         self.error: str | None = None
         self.audio_check_stop = threading.Event()
         self.audio_check_thread: threading.Thread | None = None
+        self.pause_event = threading.Event()
+        self.last_metrics = {
+            "queue_size": 0,
+            "queue_wait": 0.0,
+            "stt_latency": 0.0,
+            "llm_latency": 0.0,
+            "total_latency": 0.0,
+        }
+        self.last_auto_save_at = 0.0
 
     def is_running(self) -> bool:
         return bool(self.audio_thread and self.audio_thread.is_alive())
@@ -141,6 +160,9 @@ class TranslatorRuntime:
                 "config": dataclasses.asdict(self.config) if self.config else None,
                 "items": list(self.items),
                 "audio_check_running": self.is_audio_check_running(),
+                "paused": self.pause_event.is_set(),
+                "metrics": dict(self.last_metrics),
+                "queue_size": self.segment_queue.qsize(),
             }
 
     def start(self, config: RuntimeConfig) -> None:
@@ -152,6 +174,7 @@ class TranslatorRuntime:
             self.config = config
             self.items = []
             self.error = None
+            self.pause_event.clear()
             self.status = "starting"
 
         self._publish("status", {"status": "starting", "message": "Whisperモデルを読み込んでいます"})
@@ -183,7 +206,15 @@ class TranslatorRuntime:
             self.status = "stopping"
         self._publish("status", {"status": "stopping", "message": "停止しています"})
 
-    def save_transcript(self) -> Path:
+    def pause(self) -> None:
+        self.pause_event.set()
+        self._publish("status", {"status": "paused", "message": "一時停止中です"})
+
+    def resume(self) -> None:
+        self.pause_event.clear()
+        self._publish("status", {"status": "listening", "message": "再開しました"})
+
+    def save_transcript(self, fmt: str = "txt", prefix: str = "transcript") -> Path:
         with self.lock:
             items = list(self.items)
             config = dataclasses.asdict(self.config) if self.config else {}
@@ -192,30 +223,140 @@ class TranslatorRuntime:
 
         out_dir = Path("transcripts")
         out_dir.mkdir(exist_ok=True)
-        path = out_dir / f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        lines = [
-            "# Local LLM Realtime Translator Transcript",
-            f"saved_at: {datetime.now().isoformat(timespec='seconds')}",
-            f"config: {json.dumps(config, ensure_ascii=False)}",
-            "",
-        ]
-        for item in items:
-            lines.extend(
-                [
-                    f"[{item['time']}] {item['source_label']}",
-                    item["source_text"],
-                    f"{item['target_label']}",
-                    item["translation"],
-                    "",
-                ]
+        fmt = fmt if fmt in {"txt", "md", "jsonl", "csv", "html"} else "txt"
+        path = out_dir / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{fmt}"
+        if fmt == "jsonl":
+            path.write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+                encoding="utf-8",
             )
-        path.write_text("\n".join(lines), encoding="utf-8")
+        elif fmt == "csv":
+            with path.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["id", "time", "source_label", "source_text", "target_label", "translation", "latency"],
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(items)
+        elif fmt == "html":
+            rows = "\n".join(
+                (
+                    "<article class=\"entry\">"
+                    f"<div class=\"meta\">{html_escape(item['time'])} / {html_escape(str(item.get('latency', '')))}s</div>"
+                    "<div class=\"pair\">"
+                    f"<section><h2>{html_escape(item['source_label'])}</h2><p>{html_escape(item['source_text'])}</p></section>"
+                    f"<section><h2>{html_escape(item['target_label'])}</h2><p>{html_escape(item['translation'])}</p></section>"
+                    "</div>"
+                    "</article>"
+                )
+                for item in items
+            )
+            path.write_text(
+                f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local LLM Realtime Translator Transcript</title>
+  <style>
+    body {{ margin: 0; font-family: "Segoe UI", system-ui, sans-serif; color: #1b1f24; background: #f5f6f8; }}
+    main {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
+    h1 {{ font-size: 22px; margin: 0 0 16px; }}
+    .entry {{ background: #fff; border: 1px solid #d8dde6; border-radius: 8px; margin-bottom: 14px; overflow: hidden; }}
+    .meta {{ color: #667085; font-size: 12px; padding: 10px 14px; border-bottom: 1px solid #edf0f5; }}
+    .pair {{ display: grid; grid-template-columns: 1fr 1fr; }}
+    section {{ padding: 14px; }}
+    section + section {{ border-left: 1px solid #edf0f5; }}
+    h2 {{ color: #667085; font-size: 14px; margin: 0 0 8px; }}
+    p {{ white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; margin: 0; }}
+    @media (max-width: 760px) {{ .pair {{ grid-template-columns: 1fr; }} section + section {{ border-left: 0; border-top: 1px solid #edf0f5; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Local LLM Realtime Translator Transcript</h1>
+    {rows}
+  </main>
+</body>
+</html>
+""",
+                encoding="utf-8",
+            )
+        elif fmt == "md":
+            lines = ["# Local LLM Realtime Translator Transcript", ""]
+            for item in items:
+                lines.extend(
+                    [
+                        f"## {item['time']}",
+                        f"**{item['source_label']}**",
+                        "",
+                        item["source_text"],
+                        "",
+                        f"**{item['target_label']}**",
+                        "",
+                        item["translation"],
+                        "",
+                    ]
+                )
+            path.write_text("\n".join(lines), encoding="utf-8")
+        else:
+            lines = [
+                "# Local LLM Realtime Translator Transcript",
+                f"saved_at: {datetime.now().isoformat(timespec='seconds')}",
+                f"config: {json.dumps(config, ensure_ascii=False)}",
+                "",
+            ]
+            for item in items:
+                lines.extend(
+                    [
+                        f"[{item['time']}] {item['source_label']}",
+                        item["source_text"],
+                        f"{item['target_label']}",
+                        item["translation"],
+                        "",
+                    ]
+                )
+            path.write_text("\n".join(lines), encoding="utf-8")
         return path
+
+    def auto_save_transcript(self, fmt: str = "txt", reason: str = "manual") -> Path:
+        self.last_auto_save_at = time.time()
+        return self.save_transcript(fmt, f"autosave_{reason}")
 
     def clear_transcript(self) -> None:
         with self.lock:
             self.items = []
         self._publish("transcript_cleared", {"ok": True})
+
+    def retranslate(self, llm_model: str, lmstudio_host: str, direction: str, prompt_style: str) -> None:
+        if direction not in LANGUAGES:
+            raise RuntimeError("翻訳方向が不正です")
+        lang = LANGUAGES[direction]
+        with self.lock:
+            items = list(self.items)
+        if not items:
+            raise RuntimeError("再翻訳できる文字起こしがありません")
+        updated = []
+        for item in items:
+            translation = translate_lmstudio(
+                item["source_text"],
+                llm_model,
+                lang["source_name"],
+                lang["target_name"],
+                lmstudio_host,
+                prompt_style,
+            )
+            new_item = dict(item)
+            new_item["translation"] = translation
+            new_item["source_label"] = lang["source_label"]
+            new_item["target_label"] = lang["target_label"]
+            updated.append(new_item)
+        with self.lock:
+            self.items = updated
+        self._publish("transcript_cleared", {"ok": True})
+        for item in updated:
+            self._publish("translation", item)
 
     def iter_events(self):
         next_id = 0
@@ -335,6 +476,8 @@ class TranslatorRuntime:
                     self._publish("status", {"status": "listening", "message": "音声入力を待っています"})
                     while not self.stop_event.is_set():
                         mono = soundcard_to_pcm16(recorder.record(numframes=int(SAMPLE_RATE * FRAME_MS / 1000)))
+                        if self.pause_event.is_set():
+                            continue
                         now = time.time()
                         if now - last_level_at >= 0.1:
                             last_level_at = now
@@ -349,7 +492,7 @@ class TranslatorRuntime:
                             try:
                                 self.segment_queue.put_nowait(segment)
                             except queue.Full:
-                                self._publish("status", {"status": "warning", "message": "音声キューが満杯のため一部を破棄しました"})
+                                self._publish("status", {"status": "warning", "message": "音声キューが満杯のため一部を破棄しました。Whisperを軽くする、最大秒数を長くする、または軽いLMモデルを選んでください。"})
             except Exception as exc:
                 self._set_error(f"音声入力エラー: {type(exc).__name__}: {exc}")
                 self.stop_event.set()
@@ -367,6 +510,8 @@ class TranslatorRuntime:
             nonlocal last_level_at
             if status:
                 self._publish("status", {"status": "audio", "message": str(status)})
+            if self.pause_event.is_set():
+                return
             mono = to_mono_pcm16(indata, source.channels)
             now = time.time()
             if now - last_level_at >= 0.1:
@@ -382,7 +527,7 @@ class TranslatorRuntime:
                 try:
                     self.segment_queue.put_nowait(segment)
                 except queue.Full:
-                    self._publish("status", {"status": "warning", "message": "音声キューが満杯のため一部を破棄しました"})
+                    self._publish("status", {"status": "warning", "message": "音声キューが満杯のため一部を破棄しました。Whisperを軽くする、最大秒数を長くする、または軽いLMモデルを選んでください。"})
 
         try:
             with sd.RawInputStream(
@@ -429,16 +574,22 @@ class TranslatorRuntime:
             except queue.Empty:
                 continue
             try:
+                stt_started = time.time()
                 source_text = transcribe_segment(model, segment, lang["source_code"])
+                stt_latency = time.time() - stt_started
                 if should_skip_transcript(source_text):
                     continue
+                llm_started = time.time()
                 translation = translate_lmstudio(
                     source_text,
                     config.llm_model,
                     lang["source_name"],
                     lang["target_name"],
                     config.lmstudio_host,
+                    config.prompt_style,
                 )
+                llm_latency = time.time() - llm_started
+                total_latency = time.time() - segment.ended_at
                 item = {
                     "id": len(self.items) + 1,
                     "time": datetime.now().strftime("%H:%M:%S"),
@@ -446,11 +597,22 @@ class TranslatorRuntime:
                     "translation": translation,
                     "source_label": lang["source_label"],
                     "target_label": lang["target_label"],
-                    "latency": round(time.time() - segment.ended_at, 2),
+                    "latency": round(total_latency, 2),
+                    "stt_latency": round(stt_latency, 2),
+                    "llm_latency": round(llm_latency, 2),
+                    "queue_size": self.segment_queue.qsize(),
                 }
                 with self.lock:
                     self.items.append(item)
+                    self.last_metrics = {
+                        "queue_size": self.segment_queue.qsize(),
+                        "queue_wait": round(stt_started - segment.ended_at, 2),
+                        "stt_latency": round(stt_latency, 2),
+                        "llm_latency": round(llm_latency, 2),
+                        "total_latency": round(total_latency, 2),
+                    }
                 self._publish("translation", item)
+                self._publish("metrics", dict(self.last_metrics))
             except Exception as exc:
                 self._publish("error", {"message": f"処理エラー: {type(exc).__name__}: {exc}"})
 
@@ -470,13 +632,15 @@ def transcribe_segment(model: WhisperModel, segment: AudioSegment, language: str
     return " ".join(s.text.strip() for s in segments).strip()
 
 
-def build_translation_messages(text: str, source_language: str, target_language: str) -> list[dict[str, str]]:
+def build_translation_messages(text: str, source_language: str, target_language: str, prompt_style: str) -> list[dict[str, str]]:
+    style_instruction = PROMPT_STYLES.get(prompt_style, PROMPT_STYLES["conference"])
     return [
         {
             "role": "system",
             "content": (
                 "You are a professional real-time conference interpreter. "
                 f"Translate the user's {source_language} transcript into natural {target_language}. "
+                f"{style_instruction} "
                 "Return only the translation. Do not add explanations, notes, labels, markdown, or quotes. "
                 "If the input is incomplete, translate only what is clear and keep it concise."
             ),
@@ -485,11 +649,11 @@ def build_translation_messages(text: str, source_language: str, target_language:
     ]
 
 
-def translate_lmstudio(text: str, model: str, source_language: str, target_language: str, host: str) -> str:
+def translate_lmstudio(text: str, model: str, source_language: str, target_language: str, host: str, prompt_style: str = "conference") -> str:
     url = normalize_lmstudio_host(host) + "/chat/completions"
     payload = {
         "model": model,
-        "messages": build_translation_messages(text, source_language, target_language),
+        "messages": build_translation_messages(text, source_language, target_language, prompt_style),
         "temperature": 0.0,
         "stream": False,
     }
@@ -554,6 +718,17 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"error": f"LM Studioモデル一覧を取得できません: {exc}"}), 502
 
+    @app.get("/api/lmstudio/status")
+    def lmstudio_status():
+        host = normalize_lmstudio_host(request.args.get("host", DEFAULT_LMSTUDIO_HOST))
+        try:
+            r = requests.get(host + "/models", timeout=5)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            return jsonify({"ok": True, "models": [item.get("id") for item in data if item.get("id")]})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+
     @app.get("/api/status")
     def status():
         return jsonify(runtime.snapshot())
@@ -577,6 +752,7 @@ def create_app() -> Flask:
             silence_ms=int(data.get("silence_ms", 700)),
             min_speech_ms=int(data.get("min_speech_ms", 400)),
             max_segment_s=float(data.get("max_segment_s", 8.0)),
+            prompt_style=data.get("prompt_style") or "conference",
         )
         if not config.llm_model:
             return jsonify({"error": "LM Studioのモデルを選択してください"}), 400
@@ -589,6 +765,16 @@ def create_app() -> Flask:
     @app.post("/api/stop")
     def stop():
         runtime.stop()
+        return jsonify({"ok": True})
+
+    @app.post("/api/pause")
+    def pause():
+        runtime.pause()
+        return jsonify({"ok": True})
+
+    @app.post("/api/resume")
+    def resume():
+        runtime.resume()
         return jsonify({"ok": True})
 
     @app.post("/api/audio-check/start")
@@ -610,10 +796,34 @@ def create_app() -> Flask:
     @app.post("/api/save")
     def save():
         try:
-            path = runtime.save_transcript()
+            data = request.get_json(silent=True) or {}
+            path = runtime.save_transcript(data.get("format", "txt"))
         except Exception as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"path": str(path.resolve())})
+
+    @app.post("/api/autosave")
+    def autosave():
+        try:
+            data = request.get_json(silent=True) or {}
+            path = runtime.auto_save_transcript(data.get("format", "txt"), data.get("reason", "manual"))
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"path": str(path.resolve())})
+
+    @app.post("/api/retranslate")
+    def retranslate():
+        data = request.get_json(force=True)
+        try:
+            runtime.retranslate(
+                data.get("llm_model") or "",
+                normalize_lmstudio_host(data.get("lmstudio_host") or DEFAULT_LMSTUDIO_HOST),
+                data.get("direction", "en-ja"),
+                data.get("prompt_style") or "conference",
+            )
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True})
 
     @app.post("/api/clear")
     def clear():
@@ -876,6 +1086,30 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 13px;
     }
     .audio-state.active { color: var(--accent-strong); font-weight: 600; }
+    .status-panel {
+      margin-top: 14px;
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      border-bottom: 1px solid #edf0f5;
+      padding-bottom: 5px;
+    }
+    .status-line strong { color: var(--text); font-weight: 600; }
+    .check-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .check-row input { width: auto; min-height: auto; }
     @media (max-width: 860px) {
       main {
         grid-template-columns: 1fr;
@@ -924,9 +1158,25 @@ INDEX_HTML = r"""<!doctype html>
         <label for="llmModel">LLMモデル</label>
         <select id="llmModel"></select>
       </div>
+      <div class="field">
+        <label for="promptStyle">翻訳スタイル</label>
+        <select id="promptStyle">
+          <option value="conference">会議通訳</option>
+          <option value="literal">直訳寄り</option>
+          <option value="technical">技術用語を保持</option>
+          <option value="concise">簡潔</option>
+        </select>
+      </div>
       <div class="actions">
         <button id="reloadModels">モデル更新</button>
         <button id="reloadDevices">入力更新</button>
+      </div>
+      <div class="status-panel">
+        <div class="status-line"><span>LM Studio</span><strong id="lmStatusText">未確認</strong></div>
+        <div class="status-line"><span>キュー</span><strong id="queueMetric">0</strong></div>
+        <div class="status-line"><span>STT</span><strong id="sttMetric">0.00s</strong></div>
+        <div class="status-line"><span>LLM</span><strong id="llmMetric">0.00s</strong></div>
+        <div class="status-line"><span>合計遅延</span><strong id="totalMetric">0.00s</strong></div>
       </div>
       <div class="audio-check">
         <label>音声入力チェック</label>
@@ -973,8 +1223,31 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="actions">
         <button id="startBtn" class="primary">開始</button>
+        <button id="pauseBtn" disabled>一時停止</button>
+        <button id="resumeBtn" disabled>再開</button>
         <button id="stopBtn" class="danger" disabled>停止</button>
+      </div>
+      <div class="field">
+        <label for="saveFormat">保存形式</label>
+        <select id="saveFormat">
+          <option value="txt">TXT</option>
+          <option value="html">HTML</option>
+          <option value="md">Markdown</option>
+          <option value="jsonl">JSONL</option>
+          <option value="csv">CSV</option>
+        </select>
+      </div>
+      <label class="check-row"><input id="autoSaveOnStop" type="checkbox"> 停止時に自動保存</label>
+      <label class="check-row"><input id="autoSaveOnPause" type="checkbox"> 一時停止時に自動保存</label>
+      <label class="check-row"><input id="autoSaveOnTranslation" type="checkbox"> 翻訳ごとに自動保存</label>
+      <label class="check-row"><input id="autoSaveIntervalEnabled" type="checkbox"> 一定時間おきに自動保存</label>
+      <div class="field">
+        <label for="autoSaveIntervalSec">自動保存間隔 秒</label>
+        <input id="autoSaveIntervalSec" type="number" value="300" min="30" step="30">
+      </div>
+      <div class="actions">
         <button id="saveBtn">文字起こし保存</button>
+        <button id="retranslateBtn">再翻訳</button>
         <button id="clearBtn">表示クリア</button>
       </div>
       <div id="message" class="message"></div>
@@ -999,8 +1272,15 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
-    const state = { count: 0, running: false, audioCheckRunning: false };
+    const state = { count: 0, running: false, paused: false, audioCheckRunning: false, autoSavedForStop: false };
     const $ = (id) => document.getElementById(id);
+    const SETTINGS_KEY = "localTranslatorSettings.v2";
+    const SETTINGS_FIELDS = [
+      "direction", "inputDevice", "lmstudioHost", "llmModel", "promptStyle",
+      "whisperModel", "computeType", "silenceMs", "maxSegmentS", "saveFormat",
+      "autoSaveOnStop", "autoSaveOnPause", "autoSaveOnTranslation",
+      "autoSaveIntervalEnabled", "autoSaveIntervalSec"
+    ];
 
     const labels = {
       "en-ja": ["英語の文字起こし", "日本語訳"],
@@ -1016,8 +1296,66 @@ INDEX_HTML = r"""<!doctype html>
       state.running = running;
       $("startBtn").disabled = running;
       $("stopBtn").disabled = !running;
+      $("pauseBtn").disabled = !running || state.paused;
+      $("resumeBtn").disabled = !running || !state.paused;
       $("statusDot").className = "dot" + (running ? " running" : "");
       $("statusText").textContent = statusText || (running ? "実行中" : "停止中");
+    }
+
+    function setPaused(paused) {
+      state.paused = paused;
+      $("pauseBtn").disabled = !state.running || paused;
+      $("resumeBtn").disabled = !state.running || !paused;
+      $("statusText").textContent = paused ? "一時停止中" : (state.running ? "実行中" : "停止中");
+    }
+
+    function updateMetrics(metrics) {
+      $("queueMetric").textContent = String(metrics.queue_size ?? 0);
+      $("sttMetric").textContent = `${Number(metrics.stt_latency ?? 0).toFixed(2)}s`;
+      $("llmMetric").textContent = `${Number(metrics.llm_latency ?? 0).toFixed(2)}s`;
+      $("totalMetric").textContent = `${Number(metrics.total_latency ?? 0).toFixed(2)}s`;
+    }
+
+    function collectSettings() {
+      return {
+        direction: $("direction").value,
+        inputDevice: $("inputDevice").value,
+        lmstudioHost: $("lmstudioHost").value,
+        llmModel: $("llmModel").value,
+        promptStyle: $("promptStyle").value,
+        whisperModel: $("whisperModel").value,
+        computeType: $("computeType").value,
+        silenceMs: $("silenceMs").value,
+        maxSegmentS: $("maxSegmentS").value,
+        saveFormat: $("saveFormat").value,
+        autoSaveOnStop: $("autoSaveOnStop").checked,
+        autoSaveOnPause: $("autoSaveOnPause").checked,
+        autoSaveOnTranslation: $("autoSaveOnTranslation").checked,
+        autoSaveIntervalEnabled: $("autoSaveIntervalEnabled").checked,
+        autoSaveIntervalSec: $("autoSaveIntervalSec").value
+      };
+    }
+
+    function saveSettings() {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(collectSettings()));
+    }
+
+    function savedSettings() {
+      try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); }
+      catch { return {}; }
+    }
+
+    function applySettings(keys = SETTINGS_FIELDS) {
+      const settings = savedSettings();
+      for (const key of keys) {
+        if (!(key in settings)) continue;
+        const el = $(key);
+        if (!el) continue;
+        if (el.type === "checkbox") el.checked = Boolean(settings[key]);
+        else if (Array.from(el.options || []).some((option) => option.value === settings[key])) el.value = settings[key];
+        else if (el.tagName === "INPUT") el.value = settings[key];
+      }
+      updateHeadings();
     }
 
     function setAudioCheckRunning(running) {
@@ -1074,9 +1412,20 @@ INDEX_HTML = r"""<!doctype html>
     async function loadDevices() {
       const r = await fetch("/api/devices");
       const devices = await r.json();
-      $("inputDevice").innerHTML = '<option value="">OS既定入力</option>' + devices.map(
-        (d) => `<option value="${escapeHtml(d.value)}">${escapeHtml(d.label)}</option>`
-      ).join("");
+      const groups = [
+        ["loopback", "PC音声 / ループバック"],
+        ["input", "マイク / 入力デバイス"]
+      ];
+      let html = '<option value="">OS既定入力</option>';
+      for (const [kind, label] of groups) {
+        const rows = devices.filter((d) => d.kind === kind);
+        if (!rows.length) continue;
+        html += `<optgroup label="${label}">` + rows.map(
+          (d) => `<option value="${escapeHtml(d.value)}">${escapeHtml(d.label)}</option>`
+        ).join("") + "</optgroup>";
+      }
+      $("inputDevice").innerHTML = html;
+      applySettings(["inputDevice"]);
     }
 
     async function loadModels() {
@@ -1088,17 +1437,41 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       $("llmModel").innerHTML = data.map((id) => `<option>${escapeHtml(id)}</option>`).join("");
+      applySettings(["llmModel"]);
       setMessage(data.length ? "LM Studioモデル一覧を更新しました" : "LM Studioでモデルを読み込んでください");
+      updateLmStatus(true, `${data.length} models`);
+    }
+
+    function updateLmStatus(ok, text) {
+      $("lmStatusText").textContent = ok ? `接続OK (${text})` : "未接続";
+      $("lmStatusText").style.color = ok ? "var(--accent-strong)" : "var(--danger)";
+    }
+
+    async function checkLmStudio() {
+      const host = encodeURIComponent($("lmstudioHost").value);
+      try {
+        const r = await fetch(`/api/lmstudio/status?host=${host}`);
+        const data = await r.json();
+        if (!r.ok || !data.ok) {
+          updateLmStatus(false, "");
+          return;
+        }
+        updateLmStatus(true, `${data.models.length} models`);
+      } catch {
+        updateLmStatus(false, "");
+      }
     }
 
     async function start() {
       clearLists();
       updateHeadings();
+      state.autoSavedForStop = false;
       const payload = {
         direction: $("direction").value,
         input_device: $("inputDevice").value,
         lmstudio_host: $("lmstudioHost").value,
         llm_model: $("llmModel").value,
+        prompt_style: $("promptStyle").value,
         whisper_model: $("whisperModel").value,
         whisper_device: "auto",
         compute_type: $("computeType").value,
@@ -1114,12 +1487,24 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       setRunning(true, "起動中");
+      setPaused(false);
+      saveSettings();
       setMessage("音声入力を開始しました");
     }
 
     async function stop() {
       await fetch("/api/stop", { method: "POST" });
       setRunning(false, "停止中");
+    }
+
+    async function pause() {
+      await fetch("/api/pause", { method: "POST" });
+      setPaused(true);
+    }
+
+    async function resume() {
+      await fetch("/api/resume", { method: "POST" });
+      setPaused(false);
     }
 
     async function startAudioCheck() {
@@ -1144,13 +1529,59 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function saveTranscript() {
-      const r = await fetch("/api/save", { method: "POST" });
+      saveSettings();
+      const r = await fetch("/api/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: $("saveFormat").value })
+      });
       const data = await r.json();
       if (!r.ok) {
         setMessage(data.error || "保存できません", true);
         return;
       }
       setMessage(`保存しました: ${data.path}`);
+    }
+
+    async function autoSaveTranscript(reason) {
+      if (state.count === 0) return;
+      saveSettings();
+      const r = await fetch("/api/autosave", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: $("saveFormat").value, reason })
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setMessage(data.error || "自動保存できません", true);
+        return;
+      }
+      setMessage(`自動保存しました: ${data.path}`);
+    }
+
+    async function retranslate() {
+      if (state.count === 0) {
+        setMessage("再翻訳できる文字起こしはありません");
+        return;
+      }
+      saveSettings();
+      const payload = {
+        direction: $("direction").value,
+        lmstudio_host: $("lmstudioHost").value,
+        llm_model: $("llmModel").value,
+        prompt_style: $("promptStyle").value
+      };
+      const r = await fetch("/api/retranslate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        setMessage(data.error || "再翻訳できません", true);
+        return;
+      }
+      setMessage("再翻訳しました");
     }
 
     async function clearTranscript() {
@@ -1172,14 +1603,29 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     const events = new EventSource("/api/events");
-    events.addEventListener("translation", (event) => addEntry(JSON.parse(event.data)));
+    events.addEventListener("translation", (event) => {
+      addEntry(JSON.parse(event.data));
+      if ($("autoSaveOnTranslation").checked) autoSaveTranscript("translation");
+    });
     events.addEventListener("transcript_cleared", () => clearLists());
     events.addEventListener("status", (event) => {
       const data = JSON.parse(event.data);
       if (data.status === "listening") setRunning(true, "待機中");
-      if (data.status === "stopped") setRunning(false, "停止中");
+      if (data.status === "paused") setPaused(true);
+      if (data.status === "paused" && $("autoSaveOnPause").checked) {
+        autoSaveTranscript("pause");
+      }
+      if (data.status === "stopped") {
+        setRunning(false, "停止中");
+        setPaused(false);
+        if ($("autoSaveOnStop").checked && state.count > 0 && !state.autoSavedForStop) {
+          state.autoSavedForStop = true;
+          autoSaveTranscript("stop");
+        }
+      }
       setMessage(data.message || "");
     });
+    events.addEventListener("metrics", (event) => updateMetrics(JSON.parse(event.data)));
     events.addEventListener("audio_level", (event) => updateAudioLevel(JSON.parse(event.data)));
     events.addEventListener("audio_check_status", (event) => {
       const data = JSON.parse(event.data);
@@ -1197,15 +1643,37 @@ INDEX_HTML = r"""<!doctype html>
     $("reloadDevices").addEventListener("click", loadDevices);
     $("reloadModels").addEventListener("click", loadModels);
     $("startBtn").addEventListener("click", start);
+    $("pauseBtn").addEventListener("click", pause);
+    $("resumeBtn").addEventListener("click", resume);
     $("stopBtn").addEventListener("click", stop);
     $("audioCheckStartBtn").addEventListener("click", startAudioCheck);
     $("audioCheckStopBtn").addEventListener("click", stopAudioCheck);
     $("saveBtn").addEventListener("click", saveTranscript);
+    $("retranslateBtn").addEventListener("click", retranslate);
     $("clearBtn").addEventListener("click", clearTranscript);
+    for (const id of SETTINGS_FIELDS) {
+      const el = $(id);
+      if (!el) continue;
+      el.addEventListener("change", () => {
+        saveSettings();
+        if (id === "lmstudioHost") checkLmStudio();
+      });
+    }
 
+    applySettings();
     updateHeadings();
     loadDevices().catch((e) => setMessage(String(e), true));
     loadModels().catch((e) => setMessage(String(e), true));
+    checkLmStudio();
+    setInterval(checkLmStudio, 15000);
+    setInterval(() => {
+      if (!$("autoSaveIntervalEnabled").checked || state.count === 0) return;
+      const intervalMs = Math.max(30, Number($("autoSaveIntervalSec").value || 300)) * 1000;
+      const lastSaved = Number(localStorage.getItem("localTranslatorLastIntervalSaveAt") || "0");
+      if (Date.now() - lastSaved < intervalMs) return;
+      localStorage.setItem("localTranslatorLastIntervalSaveAt", String(Date.now()));
+      autoSaveTranscript("interval");
+    }, 5000);
   </script>
 </body>
 </html>
